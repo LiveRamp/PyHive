@@ -19,6 +19,7 @@ import logging
 import requests
 import datetime
 from requests.auth import HTTPBasicAuth
+import os
 
 try:  # Python 3
     import urllib.parse as urlparse
@@ -97,13 +98,18 @@ class Cursor(common.DBAPICursor):
     visible by other cursors or connections.
     """
 
-    def __init__(self, host, port='8080', username=None, catalog='hive',
+    def __init__(self, host, port='8080', username=None, principle_username=None, catalog='hive',
                  schema='default', poll_interval=1, source='pyhive', session_props=None,
-                 protocol='http', password=None, requests_session=None, requests_kwargs=None):
+                 protocol='http', password=None, requests_session=None, requests_kwargs=None,
+                 KerberosRemoteServiceName=None, KerberosPrincipal=None,
+                 KerberosConfigPath=None, KerberosKeytabPath=None,
+                 KerberosCredentialCachePath=None, KerberosUseCanonicalHostname=None):
         """
         :param host: hostname to connect to, e.g. ``presto.example.com``
         :param port: int -- port, defaults to 8080
         :param username: string -- defaults to system user name
+        :param principle_username: string -- defaults to ``username`` argument if it exists,
+            else defaults to system user name
         :param catalog: string -- defaults to ``hive``
         :param schema: string -- defaults to ``default``
         :param poll_interval: int -- how often to ask the Presto REST interface for a progress
@@ -119,18 +125,46 @@ class Cursor(common.DBAPICursor):
             class will use the default requests behavior of making a new session per HTTP request.
             Caller is responsible for closing session.
         :param requests_kwargs: Additional ``**kwargs`` to pass to requests
+        :param KerberosRemoteServiceName: string -- Presto coordinator Kerberos service name.
+            This parameter is required for Kerberos authentiation.
+        :param KerberosPrincipal: string -- The principal to use when authenticating to
+            the Presto coordinator.
+        :param KerberosConfigPath: string -- Kerberos configuration file.
+            (default: /etc/krb5.conf)
+        :param KerberosKeytabPath: string -- Kerberos keytab file.
+        :param KerberosCredentialCachePath: string -- Kerberos credential cache.
+        :param KerberosUseCanonicalHostname: boolean -- Use the canonical hostname of the
+            Presto coordinator for the Kerberos service principal by first resolving the
+            hostname to an IP address and then doing a reverse DNS lookup for that IP address.
+            This is enabled by default.
         """
         super(Cursor, self).__init__(poll_interval)
         # Config
         self._host = host
         self._port = port
-        self._username = username or getpass.getuser()
+        """
+        Presto User Impersonation: https://docs.starburstdata.com/latest/security/impersonation.html
+
+        User impersonation allows the execution of queries in Presto based on principle_username
+        argument, instead of executing the query as the account which authenticated against Presto.
+        (Usually a service account)
+
+        Allows for a service account to authenticate with Presto, and then leverage the
+        principle_username as the user Presto will execute the query as. This is required by
+        applications that leverage authentication methods like SAML, where the application has a
+        username, but not a password to still leverage user specific Presto Resource Groups and
+        Authorization rules that would not be applied when only using a shared service account.
+        This also allows auditing of who is executing a query in these environments, instead of
+        having all queryes run by the shared service account.
+        """
+        self._username = principle_username or username or getpass.getuser()
         self._catalog = catalog
         self._schema = schema
         self._arraysize = 1
         self._poll_interval = poll_interval
         self._source = source
         self._session_props = session_props if session_props is not None else {}
+        self.last_query_id = None
 
         if protocol not in ('http', 'https'):
             raise ValueError("Protocol must be http/https, was {!r}".format(protocol))
@@ -139,15 +173,36 @@ class Cursor(common.DBAPICursor):
         self._requests_session = requests_session or requests
 
         requests_kwargs = dict(requests_kwargs) if requests_kwargs is not None else {}
-        if password is not None and 'auth' in requests_kwargs:
-            raise ValueError("Cannot use both password and requests_kwargs authentication")
-        for k in ('method', 'url', 'data', 'headers'):
-            if k in requests_kwargs:
-                raise ValueError("Cannot override requests argument {}".format(k))
-        if password is not None:
-            requests_kwargs['auth'] = HTTPBasicAuth(username, password)
-            if protocol != 'https':
-                raise ValueError("Protocol must be https when passing a password")
+
+        if KerberosRemoteServiceName is not None:
+            from requests_kerberos import HTTPKerberosAuth, OPTIONAL
+
+            hostname_override = None
+            if KerberosUseCanonicalHostname is not None \
+                    and KerberosUseCanonicalHostname.lower() == 'false':
+                hostname_override = host
+            if KerberosConfigPath is not None:
+                os.environ['KRB5_CONFIG'] = KerberosConfigPath
+            if KerberosKeytabPath is not None:
+                os.environ['KRB5_CLIENT_KTNAME'] = KerberosKeytabPath
+            if KerberosCredentialCachePath is not None:
+                os.environ['KRB5CCNAME'] = KerberosCredentialCachePath
+
+            requests_kwargs['auth'] = HTTPKerberosAuth(mutual_authentication=OPTIONAL,
+                                                       principal=KerberosPrincipal,
+                                                       service=KerberosRemoteServiceName,
+                                                       hostname_override=hostname_override)
+
+        else:
+            if password is not None and 'auth' in requests_kwargs:
+                raise ValueError("Cannot use both password and requests_kwargs authentication")
+            for k in ('method', 'url', 'data', 'headers'):
+                if k in requests_kwargs:
+                    raise ValueError("Cannot override requests argument {}".format(k))
+            if password is not None:
+                requests_kwargs['auth'] = HTTPBasicAuth(username, password)
+                if protocol != 'https':
+                    raise ValueError("Protocol must be https when passing a password")
         self._requests_kwargs = requests_kwargs
 
         self._reset_state()
@@ -284,6 +339,8 @@ class Cursor(common.DBAPICursor):
         assert self._state == self._STATE_RUNNING, "Should be running if processing response"
         self._nextUri = response_json.get('nextUri')
         self._columns = response_json.get('columns')
+        if 'id' in response_json:
+            self.last_query_id = response_json['id']
         if 'X-Presto-Clear-Session' in response.headers:
             propname = response.headers['X-Presto-Clear-Session']
             self._session_props.pop(propname, None)
