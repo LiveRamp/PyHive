@@ -18,8 +18,6 @@ from sqlalchemy.databases import mysql
 from sqlalchemy.engine import default
 from sqlalchemy.sql import compiler
 from sqlalchemy.sql.compiler import SQLCompiler
-from sqlalchemy.sql.selectable import FromClause
-from sqlalchemy.sql.expression import Alias
 
 from pyhive import presto
 from pyhive.common import UniversalSet
@@ -54,16 +52,17 @@ class PrestoCompiler(SQLCompiler):
             column, add_to_result_map, include_table, **kwargs
         )
         table = column.table
-        return self.__add_catalog(sql, table)
+        return self._add_catalog(sql, table)
 
     def visit_table(self, table, asfrom=False, iscrud=False, ashint=False,
                     fromhints=None, use_schema=True, **kwargs):
         sql = super(PrestoCompiler, self).visit_table(
             table, asfrom, iscrud, ashint, fromhints, use_schema, **kwargs
         )
-        return self.__add_catalog(sql, table)
+        return self._add_catalog(sql, table)
 
-    def __add_catalog(self, sql, table):
+    def _add_catalog(self, sql, table):
+        from sqlalchemy.sql.expression import Alias
         if table is None:
             return sql
 
